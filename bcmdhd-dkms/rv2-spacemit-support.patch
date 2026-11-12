@@ -1,0 +1,206 @@
+diff --git a/src/Makefile b/src/Makefile
+index 3a2fc64..c0de2ca 100755
+--- a/src/Makefile
++++ b/src/Makefile
+@@ -69,6 +69,23 @@ KVER = $(shell uname -r)
+ MODDESTDIR = /lib/modules/$(KVER)/kernel/drivers/net/wireless/rockchip_wlan/rkwifi/bcmdhd/
+ ARCH = arm64
+ 
++# Spacemit K1 kernels (e.g. Orange Pi RV2) export a power-sequencing API for
++# wifi (spacemit_wlan_set_power & friends). Enable the platform hooks
++# automatically when building against such a kernel; everywhere else the
++# modules build exactly as before. Force with CONFIG_BCMDHD_SPACEMIT=y|n.
++ifneq ($(shell grep -s spacemit_wlan_set_power $(srctree)/Module.symvers \
++	/lib/modules/$(KVER)/build/Module.symvers 2>/dev/null),)
++CONFIG_BCMDHD_SPACEMIT ?= y
++endif
++
++# On Spacemit K1 the wifi hostwake pin has no working OOB irq path (the
++# in-kernel pinctrl driver does not switch the pad to GPIO function and the
++# spacemit-wlan driver no longer exposes its gpio irq), while the firmware
++# signals data in-band via the SDIO INTSTATUS. Use the SDIO ISR thread there.
++ifeq ($(CONFIG_BCMDHD_SPACEMIT),y)
++CONFIG_BCMDHD_OOB :=
++endif
++
+ CONFIG_BCMDHD_FW_PATH="/lib/firmware/ap6275p/fw_bcmdhd.bin"
+ CONFIG_BCMDHD_NVRAM_PATH="/lib/firmware/ap6275p/nvram.txt"
+ 
+@@ -433,6 +450,9 @@ ifeq ($(CONFIG_MACH_PLATFORM),y)
+ 	DHDOFILES += dhd_gpio.o
+ ifeq ($(CONFIG_BCMDHD_DTS),y)
+ 	DHDCFLAGS += -DBCMDHD_DTS
++endif
++ifeq ($(CONFIG_BCMDHD_SPACEMIT),y)
++	DHDCFLAGS += -DCONFIG_BCMDHD_SPACEMIT
+ endif
+ 	DHDCFLAGS += -DCUSTOMER_HW -DDHD_OF_SUPPORT
+ ifeq ($(CONFIG_RFKILL_RK),y)
+diff --git a/src/dhd_gpio.c b/src/dhd_gpio.c
+index 54643cd..1c76b1d 100755
+--- a/src/dhd_gpio.c
++++ b/src/dhd_gpio.c
+@@ -39,6 +39,96 @@ bcmdhd_wlan {
+ #define GPIO_WL_HOST_WAKE_PROPNAME	"gpio_wl_host_wake"
+ #endif
+ 
++#ifdef CONFIG_BCMDHD_SPACEMIT
++/*
++ * Spacemit K1 power sequencing support (e.g. Orange Pi RV2 with AP6256).
++ *
++ * On this platform the WL_REG_ON GPIO is owned by the in-kernel spacemit-wlan
++ * driver, so the wifi chip can only be powered through its exported API
++ * (same mechanism used by the in-tree rtl8852bs platform code, see
++ * drivers/net/wireless/rtl8852bs/platform/platform_spacemit_sdio.c).
++ *
++ * Guarded at four levels so the code is inert everywhere else:
++ *   1. CONFIG_BCMDHD_SPACEMIT (compile time, off by default)
++ *   2. weak symbols (no-op on kernels without the spacemit exports)
++ *   3. device tree model check (only Orange Pi RV2 variants activate it)
++ *   4. driver probe chain (requires an android,bcmdhd_wlan DT node anyway)
++ */
++#include <linux/of.h>
++extern void spacemit_wlan_set_power(bool on_off) __attribute__((weak));
++extern int spacemit_wlan_get_oob_irq(void) __attribute__((weak));
++extern void spacemit_sdio_detect_change(int enable_scan) __attribute__((weak));
++
++extern char firmware_path[MOD_PARAM_PATHLEN];
++extern char nvram_path[MOD_PARAM_PATHLEN];
++
++/*
++ * The board's DT model line is spelled differently across BredOS/spacemit
++ * kernel trees ("Orange Pi RV 2", "Orange Pi RV2" since commit c625d23,
++ * "OrangePi RV2" in 6.18+ DTS). Match all known spellings so a kernel
++ * update never silently disables wifi.
++ */
++static const char *dhd_spacemit_rv2_models[] = {
++	"Orange Pi RV 2",
++	"Orange Pi RV2",
++	"OrangePi RV2",
++	NULL,
++};
++#define DHD_SPACEMIT_FW_PATH	"/usr/lib/firmware/ap6256/fw_bcmdhd.bin"
++#define DHD_SPACEMIT_NVRAM_PATH	"/usr/lib/firmware/ap6256/nvram_ap6256.txt"
++
++/*
++ * Boards using this driver declare the wifi node in DT with
++ * compatible="android,bcmdhd_wlan" (e.g. the ap6256_wifi node on
++ * Orange Pi RV2). Export the of: modalias so udev autoloads the module
++ * on exactly those boards; elsewhere the alias never matches.
++ */
++MODULE_ALIAS("of:N*T*Candroid,bcmdhd_wlan");
++
++static void
++dhd_spacemit_setup(void)
++{
++	struct device_node *root;
++	const char *model = NULL;
++
++	/* requires the kernel-exported spacemit power sequencing API */
++	if (!spacemit_wlan_set_power || !spacemit_sdio_detect_change)
++		return;
++
++	root = of_find_node_by_path("/");
++	if (!root)
++		return;
++	of_property_read_string(root, "model", &model);
++	of_node_put(root);
++
++	/* strictly limited to the tested board */
++	if (!model)
++		return;
++	{
++		const char **m;
++		for (m = dhd_spacemit_rv2_models; *m; m++)
++			if (!strcmp(model, *m))
++				break;
++		if (!*m)
++			return;
++	}
++
++	printf("%s: %s detected, using spacemit power sequencing\n",
++		__FUNCTION__, model);
++
++	/* AP6256 firmware/nvram unless the user already pointed elsewhere */
++	if (firmware_path[0] == '\0' || !strstr(firmware_path, "ap6256"))
++		strscpy(firmware_path, DHD_SPACEMIT_FW_PATH, MOD_PARAM_PATHLEN);
++	if (nvram_path[0] == '\0' || !strstr(nvram_path, "ap6256"))
++		strscpy(nvram_path, DHD_SPACEMIT_NVRAM_PATH, MOD_PARAM_PATHLEN);
++}
++#else
++static void
++dhd_spacemit_setup(void)
++{
++}
++#endif /* CONFIG_BCMDHD_SPACEMIT */
++
+ static int
+ dhd_wlan_set_power(int on, wifi_adapter_info_t *adapter)
+ {
+@@ -54,6 +144,11 @@ dhd_wlan_set_power(int on, wifi_adapter_info_t *adapter)
+ 				return -EIO;
+ 			}
+ 		}
++#ifdef CONFIG_BCMDHD_SPACEMIT
++		/* spacemit-wlan owns WL_REG_ON; power the chip via its API */
++		if (spacemit_wlan_set_power)
++			spacemit_wlan_set_power(1);
++#endif /* CONFIG_BCMDHD_SPACEMIT */
+ #ifdef CUSTOMER_HW_ROCKCHIP
+ 		rockchip_wifi_power(1);
+ #ifdef BCMPCIE
+@@ -98,6 +193,10 @@ dhd_wlan_set_power(int on, wifi_adapter_info_t *adapter)
+ 				return -EIO;
+ 			}
+ 		}
++#ifdef CONFIG_BCMDHD_SPACEMIT
++		if (spacemit_wlan_set_power)
++			spacemit_wlan_set_power(0);
++#endif /* CONFIG_BCMDHD_SPACEMIT */
+ #ifdef CUSTOMER_HW_ROCKCHIP
+ 		rockchip_wifi_power(0);
+ #endif
+@@ -120,6 +219,10 @@ dhd_wlan_set_carddetect(int present)
+ 	if (present) {
+ #if defined(BCMSDIO)
+ 		printf("======== Card detection to detect SDIO card! ========\n");
++#ifdef CONFIG_BCMDHD_SPACEMIT
++		if (spacemit_sdio_detect_change)
++			spacemit_sdio_detect_change(1);
++#endif /* CONFIG_BCMDHD_SPACEMIT */
+ #ifdef CUSTOMER_HW_PLATFORM
+ 		err = sdhci_force_presence_change(&sdmmc_channel, 1);
+ #endif /* CUSTOMER_HW_PLATFORM */
+@@ -132,6 +235,10 @@ dhd_wlan_set_carddetect(int present)
+ 	} else {
+ #if defined(BCMSDIO)
+ 		printf("======== Card detection to remove SDIO card! ========\n");
++#ifdef CONFIG_BCMDHD_SPACEMIT
++		if (spacemit_sdio_detect_change)
++			spacemit_sdio_detect_change(0);
++#endif /* CONFIG_BCMDHD_SPACEMIT */
+ #ifdef CUSTOMER_HW_PLATFORM
+ 		err = sdhci_force_presence_change(&sdmmc_channel, 0);
+ #endif /* CUSTOMER_HW_PLATFORM */
+@@ -268,6 +375,7 @@ dhd_wlan_init_gpio(wifi_adapter_info_t *adapter)
+ 	/* Please check your schematic and fill right GPIO number which connected to
+ 	* WL_REG_ON and WL_HOST_WAKE.
+ 	*/
++	dhd_spacemit_setup();
+ #ifdef BCMDHD_DTS
+ #ifdef BCMDHD_PLATDEV
+ 	if (adapter->pdev) {
+@@ -356,6 +464,13 @@ dhd_wlan_init_gpio(wifi_adapter_info_t *adapter)
+ #endif
+ 	host_oob_irq_flags &= IRQF_TRIGGER_MASK;
+ 
++#ifdef CONFIG_BCMDHD_SPACEMIT
++	/* SDIO in-band interrupts are used on this platform (see Makefile);
++	 * kept only for boards whose kernel provides a working OOB IRQ. */
++	if (spacemit_wlan_get_oob_irq)
++		host_oob_irq = spacemit_wlan_get_oob_irq();
++#endif /* CONFIG_BCMDHD_SPACEMIT */
++
+ 	adapter->irq_num = host_oob_irq;
+ 	adapter->intr_flags = host_oob_irq_flags;
+ 	printf("%s: WL_HOST_WAKE=%d, oob_irq=%d, oob_irq_flags=0x%x\n", __FUNCTION__,

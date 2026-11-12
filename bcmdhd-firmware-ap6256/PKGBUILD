@@ -1,0 +1,29 @@
+# Maintainer: OrbitZore <orbitzore@users.noreply.github.com>
+
+pkgname=bcmdhd-firmware-ap6256
+pkgver=7.45.96.203
+pkgrel=1
+pkgdesc="Firmware for the AMPAK AP6256 (BCM43456) WiFi/Bluetooth module (e.g. Orange Pi RV2)"
+arch=('any')
+url="https://bredos.org/"
+license=('Unknown')
+depends=('bcmdhd-sdio-dkms')
+source=("fw_bcm43456c5_ag.bin"
+        "fw_bcm43456c5_ag_p2p.bin"
+        "fw_bcm43456c5_ag_apsta.bin"
+        "nvram_ap6256.txt")
+md5sums=('699f877c8923bff72ca809a1fd9ebc5a'
+         'ca63a118d10e69d0f84d8e06bbbe9d4f'
+         'ca63a118d10e69d0f84d8e06bbbe9d4f'
+         'fb9da3e35fe8d8b64316f29ef1b610a2')
+
+# Firmware extracted from the official Orange Pi RV2 vendor image
+# (same blobs the bcmdhd driver loads for chip 0x4345 rev 9).
+
+package() {
+    install -Dm644 -t "${pkgdir}/usr/lib/firmware/ap6256" \
+        "${srcdir}/fw_bcm43456c5_ag.bin" \
+        "${srcdir}/fw_bcm43456c5_ag_p2p.bin" \
+        "${srcdir}/fw_bcm43456c5_ag_apsta.bin" \
+        "${srcdir}/nvram_ap6256.txt"
+}

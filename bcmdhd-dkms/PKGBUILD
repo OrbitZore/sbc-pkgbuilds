@@ -1,14 +1,25 @@
 
 pkgname=bcmdhd-sdio-dkms
 pkgver=101.10.591.52.27
-pkgrel=3
+pkgrel=4
 pkgdesc="dkms sources for Broadcom ap6xxx SDIO"
-arch=('aarch64')
+arch=('aarch64' 'riscv64')
 depends=('dkms')
 source=("git+https://github.com/BredOS/bcmdhd-dkms.git"
-        'dkms.conf')
+        'dkms.conf'
+        'rv2-spacemit-support.patch')
 md5sums=('SKIP'
-         '1d130ed3b594fa17e1e10cc999e25a4b')
+         '3436e0248adf90ab0711392e3422ac87'
+         'cf682d6038c1c997e02b66e69cea5def')
+
+prepare() {
+    cd "${srcdir}/bcmdhd-dkms"
+    # Orange Pi RV2 (Spacemit K1 + AP6256) support. Inert elsewhere:
+    # the patched Makefile only enables the platform hooks when the target
+    # kernel exports the spacemit-wlan API, and at runtime they only
+    # activate on that board's device tree model.
+    patch -Np1 -i "${srcdir}/rv2-spacemit-support.patch"
+}
 
 package() {
     cd "${srcdir}/bcmdhd-dkms"
